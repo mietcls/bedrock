@@ -1,0 +1,67 @@
+version: 2
+
+# Every config file must have a ‘build’ job.  This is the only
+# job that will be automatically picked up and run by CircleCI.
+
+jobs:
+  build:
+    working_directory: ~/bedrock
+    docker:
+      - image: circleci/node:4.8.2
+    steps:
+      - checkout
+      # FIXME: Define these vars in environment?
+      - run: echo 'export PROJECT_NAME=bedrock' >> $BASH_ENV
+      - run: echo 'export PROJECT_DOMAIN=mono.digital' >> $BASH_ENV
+      - run: echo 'export BUCKET_NAME=$CIRCLE_BRANCH.$PROJECT_NAME.$PROJECT_DOMAIN' >> $BASH_ENV
+      - run:
+          name: check-environment
+          command: |
+              python --version
+      # FIXME: Move this part to a custom docker image.
+      # ALTERNATIVE: find a docker image that has awscli and node, and that is reliable.
+      # ALTERNATIVE: cache the installation of aws tools
+      - run:
+          name: install-aws-tools
+          command: |
+              curl -O https://bootstrap.pypa.io/get-pip.py
+              sudo python get-pip.py
+              sudo apt-get update
+              sudo apt-get install -y python-pip libpython-dev
+              sudo pip install awscli
+      - run:
+          name: get-global-deps
+          command: |
+              sudo npm install gulp -g
+              sudo npm install yarn -g
+      - restore_cache:
+          key: dependency-cache-{{ checksum "yarn.lock" }}
+      - run:
+          name: install-npm-deps
+          command: yarn install
+      - save_cache:
+          key: dependency-cache-{{ checksum "yarn.lock" }}
+          paths:
+            - .node_modules
+      - run:
+          name: build-project
+          command: gulp build
+      - run:
+          name: create-bucket
+          command: |
+              # We are handling bucket name normalization on each usage here because every
+              # command described here runs on its own shell so we can't do it in a single
+              # place for all of them. Also it doesn't work when normalizing it like we're
+              # doing in the environment vars declaration above for some reason. This
+              # works by converting branch names like `feature/lorem` into `feature-lorem`
+              # so we can avoid issues with URL when creating the website.
+              echo "Creating bucket '${BUCKET_NAME/\//-}' and uploading ./dist content to it"
+              # Create the bucket if it doesn't already exist.
+              aws s3api head-bucket --bucket "${BUCKET_NAME/\//-}" --region eu-central-1 || aws s3api create-bucket --bucket "${BUCKET_NAME/\//-}" --region eu-central-1 --create-bucket-configuration LocationConstraint=eu-central-1
+              # If creating, we need to wait until it's valid.
+              aws s3api wait bucket-exists --bucket "${BUCKET_NAME/\//-}" --region eu-central-1
+              aws s3 sync dist "s3://${BUCKET_NAME/\//-}/" --delete --region eu-central-1
+              echo '{"Version":"2012-10-17","Statement":[{"Sid":"AddPerm","Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::BUCKET_NAME/*"]}]}' > policy.json
+              export BUCKET_NAME="${BUCKET_NAME/\//-}" && sed -i "s/BUCKET_NAME/$BUCKET_NAME/g" policy.json
+              aws s3api put-bucket-policy --bucket "${BUCKET_NAME/\//-}" --region eu-central-1 --policy file://policy.json
+              aws s3 website "s3://${BUCKET_NAME/\//-}/" --region eu-central-1 --index-document index.html --error-document 404.html
